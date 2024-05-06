@@ -1,5 +1,8 @@
 # DEX Project
 
+## Note
+Before building make to rename the main folder to dex
+
 ## Overview
 This project is a decentralized exchange (DEX) implemented in the Move programming language. It uses the deepbook and custodian modules for managing order books and account capabilities respectively. The DEX supports trading between ETH and USDC.
 
