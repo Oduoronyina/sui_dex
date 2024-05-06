@@ -1,59 +1,49 @@
-
 /**
  * @title DEX Contract
  * @dev This contract implements a decentralized exchange (DEX) where users can trade ETH and USDC tokens.
- *      It also includes functionality to reward users with a custom DEX token every 2 swaps.
- *      The contract manages the creation of the DEX coin, the storage of user swap and minting data,
- *      and the execution of market and limit orders.
+ *      It includes functionality to reward users with a DEX token every 2 swaps and handles market and limit orders.
  */
 module dex::dex {
-  use std::option;
-  use std::type_name::{get, TypeName};
+    use std::option;
+    use std::type_name::{get, TypeName};
 
-  use sui::transfer;
-  use sui::sui::SUI;
-  use sui::clock::{Clock};
-  use sui::balance::{Self, Supply};
-  use sui::object::{Self, UID};
-  use sui::table::{Self, Table};
-  use sui::dynamic_field as df;
-  use sui::tx_context::{Self, TxContext};
-  use sui::coin::{Self, TreasuryCap, Coin};
+    use sui::transfer;
+    use sui::sui::SUI;
+    use sui::clock::{Clock};
+    use sui::balance::{Self, Supply};
+    use sui::object::{Self, UID};
+    use sui::table::{Self, Table};
+    use sui::dynamic_field as df;
+    use sui::tx_context::{Self, TxContext};
+    use sui::coin::{Self, TreasuryCap, Coin};
 
-  use deepbook::clob_v2::{Self as clob, Pool};
-  use deepbook::custodian_v2::AccountCap;
+    use deepbook::clob_v2::{Self as clob, Pool};
+    use deepbook::custodian_v2::AccountCap;
 
-  use dex::eth::ETH;
-  use dex::usdc::USDC;
+    use dex::eth::ETH;
+    use dex::usdc::USDC;
 
-  const CLIENT_ID: u64 = 122227;
-  const MAX_U64: u64 = 18446744073709551615;
-  // Restrictions on limit orders.
-  const NO_RESTRICTION: u8 = 0;
-  const FLOAT_SCALING: u64 = 1_000_000_000; // 1e9
+    const CLIENT_ID: u64 = 122227;
+    const MAX_U64: u64 = 18446744073709551615;
+    const NO_RESTRICTION: u8 = 0;
+    const FLOAT_SCALING: u64 = 1_000_000_000; // 1e9
 
-  const EAlreadyMintedThisEpoch: u64 = 0;
+    const EAlreadyMintedThisEpoch: u64 = 0;
 
-  // One time witness to create the DEX coin
-  struct DEX has drop {}
+    struct DEX has drop {}
 
-  struct Data<phantom CoinType> has store {
-    cap: TreasuryCap<CoinType>,
-    /*
-    * This table will store user address => last epoch minted
-    * this is to make sure that users can only mint tokens once per epoch
-    */
-    faucet_lock: Table<address, u64>
-  }
+    struct Data<phantom CoinType> has store {
+        cap: TreasuryCap<CoinType>,
+        faucet_lock: Table<address, u64> // Tracks minting per epoch
+    }
 
-  // This is an object because it has the key ability and a UID
-  struct Storage has key {
-    id: UID,
-    dex_supply: Supply<DEX>,
-    swaps: Table<address, u64>,
-    account_cap: AccountCap,
-    client_id: u64
-  }
+    struct Storage has key {
+        id: UID,
+        dex_supply: Supply<DEX>,
+        swaps: Table<address, u64>,
+        account_cap: AccountCap,
+        client_id: u64
+    }
 
   #[allow(unused_function)]
   // This function only runs at deployment
@@ -84,6 +74,76 @@ module dex::dex {
       client_id: CLIENT_ID
     });
   }
+
+  // Initializes the DEX at deployment
+    public fun init(witness: DEX, ctx: &mut TxContext) { 
+        let (treasury_cap, metadata) = coin::create_currency<DEX>(
+            witness, 
+            9, 
+            b"DEX",
+            b"DEX Coin",
+            b"Custom decentralized exchange coin",
+            ctx
+        );
+        let storage = Storage {
+            id: sui::object::new_uid(),
+            dex_supply: Supply::zero(),
+            swaps: Table::new(),
+            account_cap: deepbook::custodian_v2::new_account_cap(),
+            client_id: CLIENT_ID
+        };
+        // Additional setup can be added here
+    }
+
+    // Function to create sell orders
+    public fun create_sell_orders(
+        self: &mut Storage,
+        pool: &mut Pool<ETH, USDC>,
+        ctx: &mut TxContext
+    ) {
+        let eth_data = df::borrow_mut<TypeName, Data<ETH>>(&mut self.id, get<ETH>());
+        let deposit_amount = 60000000000000; // 60,000 ETH in smallest unit
+        assert!(coin::value(&eth_data.cap) >= deposit_amount, 400, "Insufficient ETH supply for deposit");
+
+        clob::deposit_base<ETH, USDC>(pool, coin::mint(&mut eth_data.cap, deposit_amount, ctx), &self.account_cap);
+        clob::place_limit_order(
+            pool,
+            self.client_id, // ID for this order
+            120 * FLOAT_SCALING, // price
+            deposit_amount,
+            NO_RESTRICTION,
+            false, // is_buy_order
+            MAX_U64, // no expire timestamp
+            NO_RESTRICTION,
+            ctx
+        );
+        self.client_id += 1;
+    }
+
+    // Function to create buy orders
+    public fun create_bid_orders(
+        self: &mut Storage,
+        pool: &mut Pool<ETH, USDC>,
+        ctx: &mut TxContext
+    ) {
+        let usdc_data = df::borrow_mut<TypeName, Data<USDC>>(&mut self.id, get<USDC>());
+        let deposit_amount = 6000000000000000; // 6,000,000 USDC in smallest unit
+        assert!(coin::value(&usdc_data.cap) >= deposit_amount, 400, "Insufficient USDC supply for deposit");
+
+        clob::deposit_quote<ETH, USDC>(pool, coin::mint(&mut usdc_data.cap, deposit_amount, ctx), &self.account_cap);
+        clob::place_limit_order(
+            pool,
+            self.client_id, // ID for this order
+            100 * FLOAT_SCALING, // price
+            deposit_amount,
+            NO_RESTRICTION,
+            true, // is_buy_order
+            MAX_U64, // no expire timestamp
+            NO_RESTRICTION,
+            ctx
+        );
+        self.client_id += 1;
+    }
 
   // * VIEW FUNCTIONS
 
@@ -293,37 +353,6 @@ module dex::dex {
       ctx
     );
 
-    self.client_id = self.client_id + 1;
-  }
-
-  fun create_bid_orders(
-    self: &mut Storage,
-    pool: &mut Pool<ETH, USDC>, // The CLOB pool
-    c: &Clock, // CLock shares object to know the timestamp on chain
-    ctx: &mut TxContext
-  ) {
-    // Get the USDC data from the storage
-    let usdc_data = df::borrow_mut<TypeName, Data<USDC>>(&mut self.id, get<USDC>());
-
-    // Deposit 6_000_000 USDC in the pool
-    clob::deposit_quote<ETH, USDC>(pool, coin::mint(&mut usdc_data.cap, 6000000000000000, ctx), &self.account_cap);
-
-
-        // Limit BUY Order
-    // Wanna buy 6000 ETH at 100 USDC or higher
-    clob::place_limit_order(
-      pool,
-      self.client_id, 
-      100 * FLOAT_SCALING, 
-      60000000000000,
-      NO_RESTRICTION,
-      true,
-      MAX_U64, // no expire timestamp,
-      NO_RESTRICTION,
-      c,
-      &self.account_cap,
-      ctx
-    );
     self.client_id = self.client_id + 1;
   }
 
