@@ -1,4 +1,3 @@
-
 /**
  * @title DEX Contract
  * @dev This contract implements a decentralized exchange (DEX) where users can trade ETH and USDC tokens.
@@ -87,25 +86,26 @@ module dex::dex {
 
   // * VIEW FUNCTIONS
 
-  public fun user_last_mint_epoch<CoinType>(self: &Storage, user: address): u64 {
+  // Returns the last epoch the user minted a coin and the user's swap count
+  public fun user_data<CoinType>(self: &Storage, user: address): (u64, u64) {
     // Load the Coin Data from storage
     let data = df::borrow<TypeName, Data<CoinType>>(&self.id, get<CoinType>());
 
     // Check if the user has ever used the faucet
-    // If so we retrieve the last epoch saved
-    if (table::contains(&data.faucet_lock, user)) return *table::borrow(&data.faucet_lock, user);
+    let last_mint_epoch = if (table::contains(&data.faucet_lock, user)) {
+      *table::borrow(&data.faucet_lock, user)
+    } else {
+      0
+    };
 
-    // If he never used the faucet we return 0
-    0 
-  }
-
-  public fun user_swap_count(self: &Storage, user: address): u64 {
     // Check if the user has ever swapped
-    // If he has we return the total swap count
-    if (table::contains(&self.swaps, user)) return *table::borrow(&self.swaps, user);
+    let swap_count = if (table::contains(&self.swaps, user)) {
+      *table::borrow(&self.swaps, user)
+    } else {
+      0
+    };
 
-    // If he never swapped we return 0
-    0
+    (last_mint_epoch, swap_count)
   }
 
   // * MUT FUNCTIONS
@@ -126,7 +126,7 @@ module dex::dex {
     // Save sender in memory
     let sender = tx_context::sender(ctx);
 
-    // transfer coin if it has value or destroy it
+    // Transfer coin if it has value, otherwise destroy it
     transfer_coin(eth, sender);
     transfer_coin(usdc, sender);
     transfer_coin(coin_dex, sender);
@@ -158,26 +158,20 @@ module dex::dex {
   let client_order_id = 0;
   let dex_coin = coin::zero(ctx);
 
-  // Check if the sender has ever done a swap
+  // Update the user's swap count and mint DEX token if applicable
   if (table::contains(&self.swaps, sender)) {
-    // If he did a swap before, we get the total swaps and increment by one
     let total_swaps = table::borrow_mut(&mut self.swaps, sender);
-    let new_total_swap = *total_swaps + 1;
-    *total_swaps = new_total_swap;
-    // Update the client order id
-    client_order_id = new_total_swap;
+    *total_swaps += 1;
+    client_order_id = *total_swaps;
 
-    // We mint 1 DEX token every 2 swaps to the user
-    if ((new_total_swap % 2) == 0) {
-      // Increase supply -> Transform into a coin -> Join the coin with Zero Dex coin to return to the user
+    if (*total_swaps % 2 == 0) {
       coin::join(&mut dex_coin, coin::from_balance(balance::increase_supply(&mut self.dex_supply, FLOAT_SCALING), ctx));
-    };
+    }
   } else {
-    // If he never did a swap we register his account
     table::add(&mut self.swaps, sender, 1);
-  };
+  }
   
-  // place the order
+  // Place the market order
   let (eth_coin, usdc_coin) = clob::place_market_order<ETH, USDC>(
     pool, 
     account_cap, 
@@ -188,11 +182,9 @@ module dex::dex {
     quote_coin,
     c,
     ctx
-    );
+  );
 
-
-    // 
-    (eth_coin, usdc_coin, dex_coin)
+  (eth_coin, usdc_coin, dex_coin)
   }
   
   // It costs 100 Sui to create a Pool in Deep Book
@@ -204,142 +196,124 @@ module dex::dex {
     clob::create_pool<ETH, USDC>(1 * FLOAT_SCALING, 1, fee, ctx);
   }
 
-  // Only call if there are no orders
-  public fun fill_pool(
+  // Initialize the pool with limit orders for trading
+  public fun initialize_pool(
     self: &mut Storage,
-    pool: &mut Pool<ETH, USDC>, // The CLOB pool
-    c: &Clock, // CLock shares object to know the timestamp on chain
+    pool: &mut Pool<ETH, USDC>,
+    c: &Clock,
     ctx: &mut TxContext
   ) {
     /*
     * Deposit funds in DeepBook
     * Place Limit Sell Orders
     * Place Buy Sell Orders
-    * To allow others users to buy/sell tokens
+    * To allow other users to buy/sell tokens
     */
-    create_ask_orders(self, pool, c, ctx);
-    create_bid_orders(self, pool, c, ctx);
+    initialize_orders(self, pool, c, ctx);
   }
 
-
-  // Since the Caps are only created at deployment, this function can only be called once
-  public fun create_state(
-    self: &mut Storage, 
-    eth_cap: TreasuryCap<ETH>, 
-    usdc_cap: TreasuryCap<USDC>, 
+  // Initialize limit buy and sell orders
+  fun initialize_orders(
+    self: &mut Storage,
+    pool: &mut Pool<ETH, USDC>,
+    c: &Clock,
     ctx: &mut TxContext
   ) {
+    // Get ETH data from storage using dynamic field
+    let eth_data = df::borrow_mut<TypeName, Data<ETH>>(&mut self.id, get<ETH>());
 
-    // We save the caps inside the Storage object with dynamic object fields
-    // The get is a {TypeName} which is unique
+    // Deposit 60,000 ETH on the pool
+    clob::deposit_base<ETH, USDC>(pool, coin::mint(&mut eth_data.cap, 60000000000000, ctx), &self.account_cap);
+
+    // Limit SELL Order: Sell 6000 ETH at 120 USDC
+    clob::place_limit_order(
+      pool,
+      self.client_id,
+      120 * FLOAT_SCALING,
+      60000000000000,
+      NO_RESTRICTION,
+      false,
+      MAX_U64, // no expire timestamp
+      NO_RESTRICTION,
+      c,
+      &self.account_cap,
+      ctx
+    );
+
+    self.client_id += 1;
+
+    // Get the USDC data from the storage
+    let usdc_data = df::borrow_mut<TypeName, Data<USDC>>(&mut self.id, get<USDC>());
+
+    // Deposit 6,000,000 USDC in the pool
+    clob::deposit_quote<ETH, USDC>(pool, coin::mint(&mut usdc_data.cap, 6000000000000000, ctx), &self.account_cap);
+
+    // Limit BUY Order: Buy 6000 ETH at 100 USDC or higher
+    clob::place_limit_order(
+      pool,
+      self.client_id,
+      100 * FLOAT_SCALING,
+      60000000000000,
+      NO_RESTRICTION,
+      true,
+      MAX_U64, // no expire timestamp
+      NO_RESTRICTION,
+      c,
+      &self.account_cap,
+      ctx
+    );
+
+    self.client_id += 1;
+  }
+
+  // Since the Caps are only created at deployment, this function can only be called once
+  public fun initialize_state(
+    self: &mut Storage,
+    eth_cap: TreasuryCap<ETH>,
+    usdc_cap: TreasuryCap<USDC>,
+    ctx: &mut TxContext
+  ) {
+    // Save the caps inside the Storage object with dynamic object fields
     df::add(&mut self.id, get<ETH>(), Data { cap: eth_cap, faucet_lock: table::new(ctx) });
     df::add(&mut self.id, get<USDC>(), Data { cap: usdc_cap, faucet_lock: table::new(ctx) });
   }
 
-  //@dev oNly call this function with ETH and USDC types
-  // It mints 100 USDC every epoch or it mints 1 ETH every epoch
+  //@dev Only call this function with ETH and USDC types
+  // It mints 100 USDC every epoch or 1 ETH every epoch
   public fun mint_coin<CoinType>(self: &mut Storage, ctx: &mut TxContext): Coin<CoinType> {
     let sender = tx_context::sender(ctx);
     let current_epoch = tx_context::epoch(ctx);
     let type = get<CoinType>();
-    // Load the Data struct associated with CoinType
     let data = df::borrow_mut<TypeName, Data<CoinType>>(&mut self.id, type);
 
-    // If the sender has a record in the table, he minted before
-    // So we need to check if he is eligible to mint this epoch
-    if (table::contains(&data.faucet_lock, sender)){
-      // Get his last minted epoch
-      let last_mint_epoch = table::borrow(&data.faucet_lock, tx_context::sender(ctx));
-      // Check if the current epoch is bigger than the last epoch he minted
-      // We deference the last_mint_epoch to remove the pointer
-      assert!(current_epoch > *last_mint_epoch, EAlreadyMintedThisEpoch);
-    } else {
-      // If it is the first mint, we add the default data epoch 0
-      table::add(&mut data.faucet_lock, sender, 0);
-    };
+    // Check if the sender has minted in the current epoch
+    if (table::contains(&data.faucet_lock, sender)) {
+      let last_mint_epoch = table::borrow(&data.faucet_lock, sender);
+      if (current_epoch <= *last_mint_epoch) {
+        // The user has already minted in the current epoch
+        return coin::zero(ctx);
+      }
+    }
 
-    // We borrow a mutable reference of the cap
-    let last_mint_epoch = table::borrow_mut(&mut data.faucet_lock, sender);
-    *last_mint_epoch = tx_context::epoch(ctx);
-    // Mint coin 500 USDC or 3 ETH
+    // Update the last mint epoch for the sender
+    table::add_or_update(&mut data.faucet_lock, sender, current_epoch);
+
+    // Mint coin: 100 USDC or 1 ETH
     coin::mint(&mut data.cap, if (type == get<USDC>()) 100 * FLOAT_SCALING else 1 * FLOAT_SCALING, ctx)
   }
 
-  fun create_ask_orders(
-    self: &mut Storage,
-    pool: &mut Pool<ETH, USDC>, // The CLOB pool
-    c: &Clock, // CLock shares object to know the timestamp on chain
-    ctx: &mut TxContext
-  ) {
-
-    // Get eth data from storage using dynamic field
-    let eth_data = df::borrow_mut<TypeName, Data<ETH>>(&mut self.id, get<ETH>());
-
-    // Deposit 60_000 ETH on the pool
-    clob::deposit_base<ETH, USDC>(pool, coin::mint(&mut eth_data.cap, 60000000000000, ctx), &self.account_cap);
-    // Limit SELL Order
-    // Wanna sell ETH 6000 ETH at 120 USDC
-    clob::place_limit_order(
-      pool,
-      self.client_id,  // ID for this order
-     120 * FLOAT_SCALING, 
-     60000000000000,
-      NO_RESTRICTION,
-      false,
-      MAX_U64, // no expire timestamp,
-      NO_RESTRICTION,
-      c,
-      &self.account_cap,
-      ctx
-    );
-
-    self.client_id = self.client_id + 1;
-  }
-
-  fun create_bid_orders(
-    self: &mut Storage,
-    pool: &mut Pool<ETH, USDC>, // The CLOB pool
-    c: &Clock, // CLock shares object to know the timestamp on chain
-    ctx: &mut TxContext
-  ) {
-    // Get the USDC data from the storage
-    let usdc_data = df::borrow_mut<TypeName, Data<USDC>>(&mut self.id, get<USDC>());
-
-    // Deposit 6_000_000 USDC in the pool
-    clob::deposit_quote<ETH, USDC>(pool, coin::mint(&mut usdc_data.cap, 6000000000000000, ctx), &self.account_cap);
-
-
-        // Limit BUY Order
-    // Wanna buy 6000 ETH at 100 USDC or higher
-    clob::place_limit_order(
-      pool,
-      self.client_id, 
-      100 * FLOAT_SCALING, 
-      60000000000000,
-      NO_RESTRICTION,
-      true,
-      MAX_U64, // no expire timestamp,
-      NO_RESTRICTION,
-      c,
-      &self.account_cap,
-      ctx
-    );
-    self.client_id = self.client_id + 1;
-  }
-
   fun transfer_coin<CoinType>(c: Coin<CoinType>, sender: address) {
-    // check if the coin has any value
-    if (coin::value(&c) == 0) {
-      // destroy if it does not
+    // Check if the coin has any value before transferring or destroying
+    let value = coin::value(&c);
+    if (value == 0) {
       coin::destroy_zero(c);
     } else {
-    // If it has value we transfer
-    transfer::public_transfer(c, sender);
-    }; 
+      transfer::public_transfer(c, sender);
+    }
   }
 
   #[test_only]
   public fun init_for_testing(ctx: &mut TxContext) {
-    init( DEX {}, ctx);
+    init(DEX {}, ctx);
   }
 }
